@@ -1,247 +1,202 @@
-
-
 import torch
-from mesa import Agent
-class Population(Agent):
-    def __init__(self, model,N,rng,variant_factor,name,params):
-        super().__init__(model)
+class Shard():
+    def __init__(self, df_subset, shard_id, params):
+        """
+        Un Shard agrupa varios pueblos para procesarlos juntos en la GPU.
+        """
+        self.device = 'cpu'
+        self.gpu_device = params['simulation']['device']
         self.params = params
-        self.cpu = 'cpu'
-        self.device = self.params['simulation']['device']
-        self.N = N
-        # Generador de aleatoriedad
-        self.torch_rng = rng
-        self.name = name
-        #Parámetros q requieren aleatoriedad
-        self.susceptibility = (params['distributions']['susceptibility']['base'] + 
-                                params['distributions']['susceptibility']['variance'] * 
-                                torch.rand(N, device=self.device, generator=self.torch_rng)
-                            ).to(torch.float16)
+        self.shard_id = shard_id
         
-        self.noncompliance = (params['distributions']['noncompliance']['base'] + 
-                                params['distributions']['noncompliance']['variance'] * 
-                                torch.rand(N, device=self.device, generator=self.torch_rng)
-                            ).to(torch.float16)
+        # 1. METADATOS (Identificación de pueblos)
+        # ID Global (Real del INE) y Población inicial
+        self.global_ids = torch.tensor(df_subset['id_municipio'].values, dtype=torch.long)
+        self.population_sizes = torch.tensor(df_subset['poblacion'].values, dtype=torch.float32)
         
-        self.mobility = (params['distributions']['mobility']['base'] + 
-                            params['distributions']['mobility']['variance'] *
-                            torch.rand(N, device=self.device, generator=self.torch_rng)
-                        ).to(torch.float16)
+        self.num_towns = len(df_subset)
+        self.total_N = int(self.population_sizes.sum().item())
+
+        # 2. CONSTRUCCIÓN DE MÁSCARAS DE IDENTIDAD
+        # town_ids: Dice a qué índice LOCAL (0..num_towns-1) pertenece cada agente
+        poblaciones_lista = df_subset['poblacion'].values.tolist()
+        local_indices = torch.arange(self.num_towns, dtype=torch.long)
         
-        self.age_factor = (params['distributions']['age_factor']['base'] + 
-                            params['distributions']['age_factor']['multiplier'] * 
-                            torch.rand(N, dtype=torch.float16,device=self.device)
-                        ).to(torch.float16)
+        self.town_ids = torch.repeat_interleave(
+            local_indices, 
+            torch.tensor(poblaciones_lista, dtype=torch.long)
+        )
 
-        # Datos informativos
-        self.state = torch.zeros(N, dtype=torch.uint8,device=self.device)  # 0=S, 1=I, 2=R, 3=M, 4=V
-        self.days_in_state = torch.zeros(N, dtype=torch.uint8,device=self.device)
-        self.times_infected = torch.zeros(N, dtype=torch.uint8,device=self.device)
-    
-        # Parámetros población
-        self.contacts_per_day = params['population']['contacts_per_day']
-        self.mask_factor = params['population']['mask_factor']
-        self.lockdown_factor = params['population']['lockdown_factor']
-        self.leave_prob = params['population']['leave_prob']
+        # 3. ESTADOS DE LOS AGENTES
+        # 0: Susceptible, 1: Infectado, 2: Recuperado, 3: Muerto
+        self.state = torch.zeros(self.total_N, dtype=torch.uint8)
+        self.days_in_state = torch.zeros(self.total_N, dtype=torch.int16)
+        self.susceptibility = torch.ones(self.total_N, dtype=torch.float16) 
+        # Aquí puedes añadir más (mobility, mask_usage, age...)
 
-        #Parámetros virus
-        self.recovery_day = params['virus']['recovery_day']
-        self.death_prob = params['virus']['death_prob']
-        self.P_base = params['virus']['P_base']
-        self.variant_factor = variant_factor
+        # Atributos que deben viajar a la GPU
+        self.tensor_attributes = ['state', 'days_in_state', 'susceptibility', 'town_ids']
 
-        #Variables contadoras por step
-        self.deaths_step = 0
-        self.infections_step = 0
-        self.leaves_step = 0
-        self.incomes_step = 0
+        # 4. PACIENTE CERO (Vectorizado)
+        # Usamos una semilla única por Shard para reproducibilidad
+        self.base_seed = params['simulation']['seed'] + (shard_id * 9999)
+        self._initialize_infections(params)
 
-        self.tensor_attributes = [
-            'susceptibility', 'noncompliance', 'mobility', 'age_factor',
-            'state', 'days_in_state', 'times_infected'
-        ]
-
-    def sample_contacts(self, infected_indices):
-        # Mueve los arrays a GPU temporalmente
-        susceptibles = torch.nonzero((self.state != 1) & (self.state != 3), as_tuple=True)[0]
-        if susceptibles.numel() == 0 or infected_indices.numel() == 0:
-            return torch.tensor([], dtype=torch.long)
-
-        infected_indices_gpu = infected_indices
-
-        n_contacts_per_infected = (self.contacts_per_day *
-                                   (1 - self.lockdown_factor * self.noncompliance[infected_indices_gpu]) *
-                                    self.mobility[infected_indices_gpu]).to(torch.uint16)
-        n_total_contacts = int(n_contacts_per_infected.sum().item())
-        contacts_gpu = susceptibles[torch.randint(0, len(susceptibles), (n_total_contacts,), device=self.cpu)]
-        return contacts_gpu  # regresa a CPU
-
-    def infect_contacts(self, contacts_indices):
-        if len(contacts_indices) == 0:
-            return
-
-        P_contact = self.P_base * self.susceptibility[contacts_indices] * self.noncompliance[contacts_indices] * self.variant_factor * self.mask_factor
-
-        rand = torch.rand(len(contacts_indices), device=self.device)
-
-        new_infections = rand < P_contact
-        indices_to_infect = contacts_indices[new_infections]
-
-        self.infections_step += indices_to_infect.size(0)
-        self.state[indices_to_infect] = 1
-        self.days_in_state[indices_to_infect] = 0
-        self.times_infected[indices_to_infect] += 1
-        self.susceptibility[indices_to_infect] = 1.0
-
-    def step_infection(self, batch_infected_size=500_000):
-        infected_indices = torch.nonzero(self.state == 1,as_tuple=True)[0]
-
-        total_inf = len(infected_indices)
-        if total_inf == 0:
-            return
-
-        # process infected in batches
-        for start in range(0, total_inf, batch_infected_size):
-            end = min(start + batch_infected_size, total_inf)
-            infected_batch = infected_indices[start:end]
-
-            # SAMPLE CONTACTS ONLY FOR THIS BATCH
-            contacts = self.sample_contacts(infected_batch)
-
-            # INFECT ONLY THESE CONTACTS
-            self.infect_contacts(contacts)
-
-    def step_leaving(self):
-        """
-        Remove individuals who leave this shard and return them for redistribution.
-        """
-        if self.N == 0:
-            return None  # no one to leave
-        leave_prob = self.leave_prob * self.noncompliance
-        # Mask of leaving individuals
-        leaving_mask = torch.rand(self.N, device=self.device) < leave_prob
-
-        if leaving_mask.sum() == 0:
-            return None  # nobody leaving this step
-
-        # Create a shard of leaving individuals
-        leaving_shard = {
-            'state': self.state[leaving_mask].cpu(),
-            'days_in_state': self.days_in_state[leaving_mask].cpu(),
-            'times_infected': self.times_infected[leaving_mask].cpu(),
-            'susceptibility': self.susceptibility[leaving_mask].cpu(),
-            'noncompliance': self.noncompliance[leaving_mask].cpu(),
-            'mobility': self.mobility[leaving_mask].cpu(),
-            'age_factor': self.age_factor[leaving_mask].clone().cpu()
-        }
-
-        # Keep only those who stay
-        staying_mask = ~leaving_mask
-        self.state = self.state[staying_mask]
-        self.days_in_state = self.days_in_state[staying_mask]
-        self.times_infected = self.times_infected[staying_mask]
-        self.susceptibility = self.susceptibility[staying_mask]
-        self.noncompliance = self.noncompliance[staying_mask]
-        self.mobility = self.mobility[staying_mask]
-        self.age_factor = self.age_factor[staying_mask]
-        self.N = self.state.shape[0]
-        self.leaves_step = int(leaving_mask.sum().item())
-
-        return leaving_shard
-
-    def add_new_individuals(self, new_individuals):
-        """
-        Add new individuals received from another shard.
-        `new_individuals` is a dict with the same keys as leaving_shard.
-        """
-        if new_individuals is None:
-            return  # nothing to add
-
-        for attr in self.tensor_attributes:
-            # Obtenemos el tensor actual del agente (self.state, self.mobility...)
-            current_tensor = getattr(self, attr)
-            
-            # Obtenemos el tensor que viene llegando
-            incoming_tensor = new_individuals[attr]
-            
-            # Los unimos. Importante: Ambos deben estar en el mismo dispositivo (CPU)
-            new_tensor = torch.cat([current_tensor, incoming_tensor], dim=0)
-            # Guardamos el resultado de vuelta en el agente
-            setattr(self, attr, new_tensor)
-        self.N = self.state.shape[0]
-        self.incomes_step = new_individuals['state'].size(0)
+    def _initialize_infections(self, params):
+        rate = params['simulation'].get('initial_infection_rate', 0.005)
+        if rate <= 0: return
         
-    def remove_dead(self):
-        """
-        Remove dead individuals permanently from this shard.
-        """
-        if self.N == 0:
-            return
-
-        # Assuming dead state is 3 (or whichever you choose)
-        alive_mask = self.state != 3
-        self.state = self.state[alive_mask]
-        self.days_in_state = self.days_in_state[alive_mask]
-        self.times_infected = self.times_infected[alive_mask]
-        self.susceptibility = self.susceptibility[alive_mask]
-        self.noncompliance = self.noncompliance[alive_mask]
-        self.mobility = self.mobility[alive_mask]
-        self.age_factor = self.age_factor[alive_mask]
-        self.N = self.state.shape[0]
-
-    def step_progression(self):
-        """
-        Progresses the state of the population:
-        - Increments days in state for infected.
-        - Applies per-step death probability for infected individuals.
-        - Moves survivors to recovered after recovery_day.
-        """
-        # Boolean mask of infected individuals
-        infected_mask = self.state == 1
-        if not infected_mask.any():
-            return  # no infected to progress
-
-        # Step 1: Increment days in state for infected
-        self.days_in_state[infected_mask] += 1
-
-        # Step 2: Death chance per step (only infected)
-        infected_indices = torch.nonzero(infected_mask, as_tuple=True)[0]
-        death_prob = self.death_prob * self.age_factor[infected_indices]
-        rand_vals = torch.rand(infected_indices.size(0), device=self.device)
-        dying_indices = infected_indices[rand_vals < death_prob]
-
-        # Apply deaths in-place
-        self.state[dying_indices] = 3
-        self.deaths_step = dying_indices.size(0)
-
-        # Step 3: Recovery for infected who survived past recovery_day
-        ready_to_recover = infected_indices[self.days_in_state[infected_indices] >= self.recovery_day]
-        ready_to_recover = ready_to_recover[self.state[ready_to_recover] != 3]  # exclude dead
-        self.state[ready_to_recover] = 2
+        # Infectamos un % de la población total del Shard
+        num_infected = int(self.total_N * rate)
+        if num_infected == 0 and self.total_N > 0: num_infected = 1
+        
+        rng = torch.Generator().manual_seed(self.base_seed)
+        indices = torch.randperm(self.total_N, generator=rng)[:num_infected]
+        
+        self.state[indices] = 1 # Infectado
+        self.days_in_state[indices] = 1 
 
     def to_gpu(self):
+        self.population_sizes = self.population_sizes.to(self.gpu_device)
         for attr in self.tensor_attributes:
-            # getattr obtiene el valor, .to() lo mueve, setattr lo guarda de nuevo
-            tensor = getattr(self, attr)
-            setattr(self, attr, tensor.to(self.device))
-        self.device = self.device
+            t = getattr(self, attr)
+            setattr(self, attr, t.to(self.gpu_device))
+        self.device = self.gpu_device
 
     def to_cpu(self):
+        self.population_sizes = self.population_sizes.to('cpu')
         for attr in self.tensor_attributes:
-            # getattr obtiene el valor, .to() lo mueve, setattr lo guarda de nuevo
-            tensor = getattr(self, attr)
-            setattr(self, attr, tensor.to(self.cpu))
-        self.device = self.cpu
-        torch.cuda.empty_cache()
+            t = getattr(self, attr)
+            setattr(self, attr, t.to('cpu'))
+        self.device = 'cpu'
+        # torch.cuda.empty_cache() # Opcional: limpiar caché si hay poca VRAM
 
-    def step(self):
-        self.to_gpu()
-        self.step_infection()     # spread disease
-        self.step_progression()        # healing, state updates
-        self.remove_dead()        # permanently remove deaths
-        leaving = self.step_leaving()  # remove leaving individuals
-        self.to_cpu()
-        return leaving
+    # --- LÓGICA DE SIMULACIÓN ---
+
+    def step_infection(self, generator):
+        """Calcula nuevos contagios respetando las fronteras de los pueblos"""
+        infected_mask = (self.state == 1)
+        if not infected_mask.any(): return
+
+        # 1. Contar infectados por pueblo (Local Index)
+        infected_counts = torch.bincount(self.town_ids[infected_mask], minlength=self.num_towns).float()
         
+        # 2. Densidad local (Infectados / Población del pueblo)
+        # Sumamos epsilon para evitar división por cero si un pueblo se vacía
+        densities = infected_counts / (self.population_sizes + 1e-6)
+        
+        # 3. Asignar riesgo individual
+        my_density = densities[self.town_ids]
+        
+        # 4. Física
+        p_base = self.params['virus']['P_base']
+        contacts = self.params['population']['contacts_per_day']
+        
+        risk = 1.0 - torch.pow(1.0 - p_base * my_density, contacts)
+        
+        # 5. Tirar dados
+        susceptibles = (self.state == 0)
+        rand_vals = torch.rand(self.total_N, device=self.device, generator=generator)
+        new_infections = susceptibles & (rand_vals < risk)
+        
+        if new_infections.any():
+            self.state[new_infections] = 1
+            self.days_in_state[new_infections] = 0
 
+    def step_recover(self, generator):
+        """Evolución: Muerte o Recuperación"""
+        infected_mask = (self.state == 1)
+        if not infected_mask.any(): return
+        
+        # Avanzar días
+        self.days_in_state[infected_mask] += 1
+        
+        # Muerte
+        death_prob = self.params['virus']['death_prob']
+        rand_vals = torch.rand(self.total_N, device=self.device, generator=generator)
+        dying_mask = infected_mask & (rand_vals < death_prob)
+        
+        if dying_mask.any():
+            self.state[dying_mask] = 3 # Dead
+            infected_mask = infected_mask & (~dying_mask) # Ya no cuenta como infectado
+            
+        # Recuperación
+        recovery_days = self.params['virus']['recovery_day']
+        recovering_mask = infected_mask & (self.days_in_state >= recovery_days)
+        
+        if recovering_mask.any():
+            self.state[recovering_mask] = 2 # Recovered
 
+    def step_leaving(self, generator):
+        """Decide quién viaja y devuelve sus datos"""
+        prob_leave = self.params['population']['leave_prob']
+        rand_vals = torch.rand(self.total_N, device=self.device, generator=generator)
+        
+        # Condición: Querer viajar Y no estar muerto
+        leaving_mask = (rand_vals < prob_leave) & (self.state != 3)
+        
+        num_leavers = leaving_mask.sum().item()
+        if num_leavers == 0: return None
+        
+        # --- PASO 1: Capturar IDs para el conteo (ANTES DE BORRAR NADA) ---
+        # Guardamos los town_ids de los que se van mientras el tensor sigue completo.
+        # Lo mantenemos en el device actual (GPU/CPU) para hacer el bincount rápido.
+        ids_leaving_device = self.town_ids[leaving_mask]
+
+        # --- PASO 2: Empaquetar datos para el viaje (Mover a CPU) ---
+        leavers = {}
+        for attr in self.tensor_attributes:
+            # Extraemos y mandamos a CPU para el enrutador
+            leavers[attr] = getattr(self, attr)[leaving_mask].to('cpu')
+            
+        # Añadir ID Global de origen (ahora seguro porque leavers está en CPU)
+        leavers['origin_global_id'] = self.global_ids[leavers['town_ids']]
+        
+        # --- PASO 3: Actualizar Población (Usando los IDs capturados en Paso 1) ---
+        # Es crucial hacer esto antes o usando la variable auxiliar, no el tensor principal
+        leavers_count = torch.bincount(ids_leaving_device, minlength=self.num_towns).float()
+        self.population_sizes -= leavers_count
+
+        # --- PASO 4: ELIMINAR AGENTES (Operación Destructiva) ---
+        # Ahora sí, reducimos el tamaño de los tensores principales
+        keep_mask = ~leaving_mask
+        for attr in self.tensor_attributes:
+            setattr(self, attr, getattr(self, attr)[keep_mask])
+            
+        self.total_N = self.state.shape[0]
+        
+        return leavers
+
+    def add_incomers(self, incomers_dict, dest_local_ids):
+        """Recibe viajeros y los añade a los tensores"""
+        if incomers_dict is None or len(dest_local_ids) == 0: return
+        
+        # Actualizar town_ids de los que llegan para que coincidan con este Shard
+        incomers_dict['town_ids'] = dest_local_ids.to(self.device)
+        
+        # Concatenar
+        for attr in self.tensor_attributes:
+            current = getattr(self, attr)
+            incoming = incomers_dict[attr].to(self.device)
+            setattr(self, attr, torch.cat([current, incoming], dim=0))
+            
+        self.total_N = self.state.shape[0]
+        
+        # Actualizar conteos
+        new_counts = torch.bincount(dest_local_ids.to(self.device), minlength=self.num_towns).float()
+        self.population_sizes += new_counts
+
+    def get_summary(self):
+        """Métricas rápidas"""
+        counts = torch.bincount(self.state, minlength=4)
+        return {
+            'S': int(counts[0].item()),
+            'I': int(counts[1].item()),
+            'R': int(counts[2].item()),
+            'D': int(counts[3].item())
+        }
+
+    def step(self, generator):
+        self.step_infection(generator)
+        self.step_recover(generator)
+        return self.step_leaving(generator)

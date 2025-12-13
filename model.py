@@ -1,161 +1,152 @@
-from mesa import Model
-import yaml
-from agent import Population
-import torch
 import pandas as pd
+import torch
+import yaml
 from tqdm import tqdm
-class EpidemicModel(Model):
-    def __init__(self, csv_path,config_path):
-        super().__init__()
-        with open(config_path,'r') as f:
+from agent import Shard
+
+class EpidemicModel:
+    def __init__(self, df_data, config_path='config.yaml'):
+        """
+        df_data: DataFrame LIMPIO donde 'id_municipio' YA ES un entero (0..N).
+        """
+        with open(config_path, 'r') as f:
             self.params = yaml.safe_load(f)
-
-        self.shared_rng = torch.Generator(device=self.params['simulation']['device'])
-        self.seed = self.params['simulation']['seed']
-        self.shared_rng.manual_seed(self.seed)
-
-        self.variants_schedule = self.params['virus']['variantes']
-        self.variants_schedule.sort(key=lambda x: x['start_step'])
-        
-
-        self.current_variant_factor = 1.0
-        self.current_variant_name = "Original"
-
-        print(f"Cargando censo desde {csv_path}...")
-        try:
-            df = pd.read_csv(csv_path)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"No encuentro el archivo: {csv_path}")
-
-        self.poblaciones = []
-        col_nombre = 'id_municipio' # O 'NOMBRE'
-        col_pob = 'poblacion'       # O 'POB25'
-        for idx, row in df.iterrows():
-            nombre = row[col_nombre]
-            poblacion = int(row[col_pob])
-
-            # Saltamos pueblos vacíos o con errores para no romper PyTorch
-            if poblacion <= 0:
-                continue
-
-            # Instanciamos el agente
-            # idx: Es el número de fila (0, 1, 2...) -> Sirve para la semilla
-            # nombre: Es el texto ("Madrid") -> Sirve para logs
-            nuevo_pueblo = Population(
-                model=self,
-                N=poblacion, 
-                rng=self.shared_rng,
-                variant_factor=self.current_variant_factor,
-                name=nombre, 
-                params=self.params
-            )
             
-            self.poblaciones.append(nuevo_pueblo)
-        self.num_pueblos = len(self.poblaciones)
+        self.device = torch.device(self.params['simulation']['device'])
+        self.step_count = 0
+        self.history = []
+        
+        # 1. PREPARACIÓN ESTRUCTURAL
+        self.num_pueblos = len(df_data)
+        
+        # El buzón tiene el tamaño exacto del número de filas
         self.mailbox = [[] for _ in range(self.num_pueblos)]
         
-        print(f"✅ Modelo iniciado: {self.num_pueblos} nodos, Aleatoriedad pura.")
-
-        print(f"   Población total simulada: {sum(p.N for p in self.poblaciones):,}")
-
-    def _choose_destinations(self, num_leavers, origin_node_id):
-        """
-        CEREBRO: Decide los IDs de destino para un grupo de viajeros.
-        Actualmente implementa: MOVILIDAD ALEATORIA UNIFORME.
-        """
-        # Generamos enteros aleatorios entre 0 y num_pueblos
-        # low=0, high=self.num_pueblos
-        destinations = torch.randint(
-            low=0, 
-            high=self.num_pueblos, 
-            size=(num_leavers,), 
-            dtype=torch.long
-        )
-        return destinations
-
-    def _route_travelers(self, leavers, origin_node_id, target_mailbox):
-        """
-        MÚSCULO: Orquestra el movimiento de salida.
-        1. Pregunta al cerebro a dónde van.
-        2. Usa el helper para trocear los datos y meterlos en buzones.
-        """
-        if leavers is None:
-            return 0
-
-        # 1. Calculamos cuántos se van
-        # Usamos la primera key disponible para ver el tamaño (ej: 'susceptibility')
-        first_key = list(leavers.keys())[0]
-        num_leavers = leavers[first_key].shape[0]
-
-        if num_leavers == 0:
-            return 0
-
-        # 2. Elegimos destinos (Aquí es donde cambiarás la lógica en el futuro)
-        destinations = self._choose_destinations(num_leavers, origin_node_id)
-
-        # 3. Distribuimos físicamente los datos a los buzones
-        self._distribute_to_mailboxes(leavers, destinations, target_mailbox)
+        self.shards = []
+        self.routing_table = {} 
         
-        return num_leavers
-    
+        TARGET_SHARD_SIZE = 500_000 
+        
+        batch = []
+        current_pop = 0
+        shard_idx = 0
+        
+        # Lista temporal para saber qué IDs (índices) son válidos para viajar
+        valid_ids_list = []
+        
+        # 2. CREACIÓN DE SHARDS
+        print(f"⚙️  Distribuyendo {self.num_pueblos} municipios en Shards GPU...")
+        
+        # Iteramos sobre el DataFrame que nos pasó el main
+        for _, row in tqdm(df_data.iterrows(), total=self.num_pueblos, desc="Creando Shards", unit="pueblo"):
+            pop = int(row['poblacion'])
+            if pop <= 0: continue
+            
+            # Como id_municipio es el índice, esto es un entero seguro
+            valid_ids_list.append(int(row['id_municipio']))
+            
+            batch.append(row)
+            current_pop += pop
+            
+            if current_pop >= TARGET_SHARD_SIZE:
+                self._create_shard(batch, shard_idx)
+                batch = []
+                current_pop = 0
+                shard_idx += 1
+                
+        if batch: self._create_shard(batch, shard_idx)
+        
+        # Tensor de IDs válidos para el enrutador (viajes rápidos)
+        self.valid_ids = torch.tensor(valid_ids_list, dtype=torch.long, device='cpu')
+        
+        print(f"✅ Sharding completado: {len(self.shards)} bloques en {self.device}.")
+
+    def _create_shard(self, batch, idx):
+        df_subset = pd.DataFrame(batch)
+        # agent.py recibirá este subset con la columna 'id_municipio' corregida
+        new_shard = Shard(df_subset, idx, self.params)
+        self.shards.append(new_shard)
+        
+        # Rellenar tabla de enrutamiento
+        for local_idx, global_id in enumerate(new_shard.global_ids.tolist()):
+            self.routing_table[global_id] = (idx, local_idx)
+
+    def step(self):
+        # Reiniciamos buzón
+        next_mailbox = [[] for _ in range(self.num_pueblos)]
+        daily_stats = {'day': self.step_count, 'S':0, 'I':0, 'R':0, 'D':0, 'Moves': 0}
+        
+        # Barra de progreso interna (oculta al terminar para no ensuciar)
+        pbar = tqdm(self.shards, desc=f"Día {self.step_count}", leave=False, unit="shard")
+        
+        for shard in pbar:
+            # --- FASE 1: CHECK-IN ---
+            shard_incomers = []
+            shard_dest_ids = []
+            
+            for local_idx, global_id in enumerate(shard.global_ids.tolist()):
+                # global_id es un entero (índice), acceso directo ultra-rápido
+                mail = self.mailbox[global_id]
+                if mail:
+                    merged = self._merge_travelers(mail)
+                    if merged:
+                        shard_incomers.append(merged)
+                        n = merged['state'].shape[0]
+                        shard_dest_ids.append(torch.full((n,), local_idx, dtype=torch.long))
+            
+            if shard_incomers:
+                final_incomers = self._merge_travelers(shard_incomers)
+                final_dest_ids = torch.cat(shard_dest_ids)
+                shard.add_incomers(final_incomers, final_dest_ids)
+
+            # --- FASE 2: SIMULACIÓN ---
+            shard.to_gpu()
+            seed = shard.base_seed + (self.step_count * 1000)
+            rng = torch.Generator(device=self.device).manual_seed(seed)
+            leavers = shard.step(rng)
+            
+            stats = shard.get_summary()
+            for k in ['S','I','R','D']: daily_stats[k] += stats[k]
+            shard.to_cpu()
+            
+            # --- FASE 3: ENRUTAMIENTO ---
+            if leavers:
+                num_leavers = leavers['state'].shape[0]
+                daily_stats['Moves'] += num_leavers
+                
+                # Sorteo de destinos usando solo índices válidos
+                idx_choices = torch.randint(0, len(self.valid_ids), (num_leavers,))
+                destinations = self.valid_ids[idx_choices]
+                
+                self._distribute_to_mailboxes(leavers, destinations, next_mailbox)
+            
+            pbar.set_postfix(I=f"{daily_stats['I']:,}")
+
+        self.mailbox = next_mailbox
+        self.history.append(daily_stats)
+        self.step_count += 1
+        
+        return daily_stats
+
+    # Helpers
     def _merge_travelers(self, list_of_dicts):
         if not list_of_dicts: return None
         merged = {}
-        keys = list_of_dicts[0].keys()
-        for key in keys:
+        for key in list_of_dicts[0].keys():
             merged[key] = torch.cat([d[key] for d in list_of_dicts], dim=0)
         return merged
 
-    def _distribute_to_mailboxes(self, leavers_dict, destinations, target_mailbox):
+    def _distribute_to_mailboxes(self, leavers, destinations, target_mailbox):
         unique_dests = torch.unique(destinations)
         for dest_id in unique_dests:
-            dest_idx = int(dest_id.item())
+            d_id = int(dest_id.item())
+            if d_id >= len(target_mailbox): continue
+            
             mask = (destinations == dest_id)
-            
-            package = {}
-            for key, tensor in leavers_dict.items():
-                package[key] = tensor[mask]
-            
-            target_mailbox[dest_idx].append(package)
+            package = {k: v[mask] for k, v in leavers.items()}
+            target_mailbox[d_id].append(package)
 
-    def step(self):
-        next_day_mailbox = [[] for _ in range(self.num_pueblos)]
-        total_travelers = 0
-
-        for i, p in enumerate(self.poblaciones):
-            
-            # --- FASE 1: ENTRADA (Check-in) ---
-            # Si hay gente en el buzón, la metemos. Si no, reseteamos contadores.
-            incomers = self._merge_travelers(self.mailbox[i]) if self.mailbox[i] else None
-            p.add_new_individuals(incomers)
-
-            # --- FASE 2: SIMULACIÓN (GPU Work) ---
-            p.to_gpu()
-            
-            # Semilla determinista
-            self.shared_rng.manual_seed(self.seed + i)
-            
-            # Ejecutar lógica
-            leavers = p.step()
-            
-            p.to_cpu()
-            
-            # --- FASE 3: SALIDA (Routing) ---
-            # Delegamos toda la complejidad al nuevo método
-            count = self._route_travelers(
-                leavers=leavers, 
-                origin_node_id=i,  # Pasamos 'i' por si el enrutamiento necesita saber el origen
-                target_mailbox=next_day_mailbox
-            )
-            total_travelers += count
-
-        # Rotación de buzones y avance del tiempo
-        self.mailbox = next_day_mailbox
-if __name__ == '__main__':
-    archivo_csv = "poblacion_procesada.csv" 
-    archivo_yaml = "params.yaml"
-
-    # Iniciar modelo
-    modelo = EpidemicModel(csv_path=archivo_csv, config_path=archivo_yaml)
-    for dia in tqdm(range(100)):
-        modelo.step()
+    def export_results(self, filename="resultados.csv"):
+        df = pd.DataFrame(self.history)
+        df.to_csv(filename, index=False)
+        return df
