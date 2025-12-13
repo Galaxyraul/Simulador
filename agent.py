@@ -1,47 +1,60 @@
 
 
 import torch
-from tqdm import tqdm
-import time
-import psutil
-class PopulationShard:
-    def __init__(self, N, node_id, seed=42, device='cuda'):
-        self.device = device
+from mesa import Agent
+class Population(Agent):
+    def __init__(self, model,N,rng,variant_factor,name,params):
+        super().__init__(model)
+        self.params = params
+        self.cpu = 'cpu'
+        self.device = self.params['simulation']['device']
         self.N = N
-        self.node_id = node_id
+        # Generador de aleatoriedad
+        self.torch_rng = rng
+        self.name = name
+        #Parámetros q requieren aleatoriedad
+        self.susceptibility = (params['distributions']['susceptibility']['base'] + 
+                                params['distributions']['susceptibility']['variance'] * 
+                                torch.rand(N, device=self.device, generator=self.torch_rng)
+                            ).to(torch.float16)
+        
+        self.noncompliance = (params['distributions']['noncompliance']['base'] + 
+                                params['distributions']['noncompliance']['variance'] * 
+                                torch.rand(N, device=self.device, generator=self.torch_rng)
+                            ).to(torch.float16)
+        
+        self.mobility = (params['distributions']['mobility']['base'] + 
+                            params['distributions']['mobility']['variance'] *
+                            torch.rand(N, device=self.device, generator=self.torch_rng)
+                        ).to(torch.float16)
+        
+        self.age_factor = (params['distributions']['age_factor']['base'] + 
+                            params['distributions']['age_factor']['multiplier'] * 
+                            torch.rand(N, dtype=torch.float16,device=self.device)
+                        ).to(torch.float16)
 
-        # Random generator (CPU)
-        self.rng = torch.Generator(device=self.device)
-        self.rng.manual_seed(seed)
+        # Datos informativos
+        self.state = torch.zeros(N, dtype=torch.uint8,device=self.device)  # 0=S, 1=I, 2=R, 3=M, 4=V
+        self.days_in_state = torch.zeros(N, dtype=torch.uint8,device=self.device)
+        self.times_infected = torch.zeros(N, dtype=torch.uint8,device=self.device)
+    
+        # Parámetros población
+        self.contacts_per_day = params['population']['contacts_per_day']
+        self.mask_factor = params['population']['mask_factor']
+        self.lockdown_factor = params['population']['lockdown_factor']
+        self.leave_prob = params['population']['leave_prob']
 
-        # --- Datos de cálculo de infección (CPU) ---
-        self.susceptibility = (0.7 + 0.3 * torch.rand(N, device=device, generator=self.rng)).to(torch.float16)
-        # Cumplimiento de normas, mascarillas, lockdown
-        self.noncompliance = (0.2 + 0.8 * torch.rand(N, device=device, generator=self.rng)).to(torch.float16)
-        # Movilidad interna: ajusta número de contactos diarios
-        self.mobility = (0.5 + 0.5 * torch.rand(N, device=device, generator=self.rng)).to(torch.float16)
+        #Parámetros virus
+        self.recovery_day = params['virus']['recovery_day']
+        self.death_prob = params['virus']['death_prob']
+        self.P_base = params['virus']['P_base']
+        self.variant_factor = variant_factor
 
-        # --- Datos informativos / progresión (CPU) ---
-        self.state = torch.zeros(N, dtype=torch.uint8,device=device)  # 0=S, 1=I, 2=R, 3=M, 4=V
-        self.days_in_state = torch.zeros(N, dtype=torch.uint8,device=device)
-        self.times_infected = torch.zeros(N, dtype=torch.uint8,device=device)
-        self.age_factor = (0.1 + 2 * torch.rand(N, dtype=torch.float16,device=device))
-
-        # --- Parámetros de simulación ---
-        self.contacts_per_day = 30
-        self.P_base = 0.1
-        self.variant_factor = 1.0
-        self.mask_factor = 0.5
-        self.lockdown_factor = 0.4
-        self.min_days_infected = 5
-        self.max_days_infected = 14
-        self.recovery_day = 7
-        self.death_prob = 0.01
-        self.leave_prob = 1e-4
-        self.deaths = 0
-        self.infections = 0
-        self.leaves = 0
-        self.incomes = 0
+        #Variables contadoras por step
+        self.deaths_step = 0
+        self.infections_step = 0
+        self.leaves_step = 0
+        self.incomes_step = 0
 
     def sample_contacts(self, infected_indices):
         # Mueve los arrays a GPU temporalmente
@@ -53,9 +66,9 @@ class PopulationShard:
 
         n_contacts_per_infected = (self.contacts_per_day *
                                    (1 - self.lockdown_factor * self.noncompliance[infected_indices_gpu]) *
-                                   self.mobility[infected_indices_gpu]).to(torch.uint16)
+                                    self.mobility[infected_indices_gpu]).to(torch.uint16)
         n_total_contacts = int(n_contacts_per_infected.sum().item())
-        contacts_gpu = susceptibles[torch.randint(0, len(susceptibles), (n_total_contacts,), device='cpu')]
+        contacts_gpu = susceptibles[torch.randint(0, len(susceptibles), (n_total_contacts,), device=self.cpu)]
         return contacts_gpu  # regresa a CPU
 
     def infect_contacts(self, contacts_indices):
@@ -69,7 +82,7 @@ class PopulationShard:
         new_infections = rand < P_contact
         indices_to_infect = contacts_indices[new_infections]
 
-        self.infections += indices_to_infect.size(0)
+        self.infections_step += indices_to_infect.size(0)
         self.state[indices_to_infect] = 1
         self.days_in_state[indices_to_infect] = 0
         self.times_infected[indices_to_infect] += 1
@@ -108,13 +121,13 @@ class PopulationShard:
 
         # Create a shard of leaving individuals
         leaving_shard = {
-            'state': self.state[leaving_mask].clone(),
-            'days_in_state': self.days_in_state[leaving_mask].clone(),
-            'times_infected': self.times_infected[leaving_mask].clone(),
-            'susceptibility': self.susceptibility[leaving_mask].clone(),
-            'noncompliance': self.noncompliance[leaving_mask].clone(),
-            'mobility': self.mobility[leaving_mask].clone(),
-            'age_factor': self.age_factor[leaving_mask].clone()
+            'state': self.state[leaving_mask].cpu(),
+            'days_in_state': self.days_in_state[leaving_mask].cpu(),
+            'times_infected': self.times_infected[leaving_mask].cpu(),
+            'susceptibility': self.susceptibility[leaving_mask].cpu(),
+            'noncompliance': self.noncompliance[leaving_mask].cpu(),
+            'mobility': self.mobility[leaving_mask].cpu(),
+            'age_factor': self.age_factor[leaving_mask].clone().cpu()
         }
 
         # Keep only those who stay
@@ -127,7 +140,7 @@ class PopulationShard:
         self.mobility = self.mobility[staying_mask]
         self.age_factor = self.age_factor[staying_mask]
         self.N = self.state.shape[0]
-        self.leaves = int(leaving_mask.sum().item())
+        self.leaves_step = int(leaving_mask.sum().item())
 
         return leaving_shard
 
@@ -147,7 +160,7 @@ class PopulationShard:
         self.mobility = torch.cat([self.mobility, new_individuals['mobility']], dim=0)
         self.age_factor = torch.cat([self.age_factor, new_individuals['age_factor']], dim=0)
         self.N = self.state.shape[0]
-        self.incomes = new_individuals.size(0)
+        self.incomes_step = new_individuals.size(0)
         
     def remove_dead(self):
         """
@@ -190,20 +203,42 @@ class PopulationShard:
 
         # Apply deaths in-place
         self.state[dying_indices] = 3
-        self.deaths = dying_indices.size(0)
+        self.deaths_step = dying_indices.size(0)
 
         # Step 3: Recovery for infected who survived past recovery_day
         ready_to_recover = infected_indices[self.days_in_state[infected_indices] >= self.recovery_day]
         ready_to_recover = ready_to_recover[self.state[ready_to_recover] != 3]  # exclude dead
         self.state[ready_to_recover] = 2
 
+    def to_gpu(self):
+        self.susceptibility = self.susceptibility.to(self.device)
+        self.noncompliance = self.noncompliance.to(self.device)
+        self.mobility = self.mobility.to(self.device)
+        self.age_factor = self.age_factor.to(self.device)
+        self.state = self.state.to(self.device)
+        self.days_in_state = self.days_in_state.to(self.device)
+        self.times_infected = self.times_infected.to(self.device)
+        self.device = self.device
+
+    def to_cpu(self):
+        self.susceptibility = self.susceptibility.to(self.cpu)
+        self.noncompliance = self.noncompliance.to(self.cpu)
+        self.mobility = self.mobility.to(self.cpu)
+        self.age_factor = self.age_factor.to(self.cpu)
+        self.state = self.state.to(self.cpu)
+        self.days_in_state = self.days_in_state.to(self.cpu)
+        self.times_infected = self.times_infected.to(self.cpu)
+        self.device = self.cpu
+        torch.cuda.empty_cache()
 
     def step(self):
+        self.to_gpu()
         self.step_infection()     # spread disease
         self.step_progression()        # healing, state updates
         self.remove_dead()        # permanently remove deaths
         leaving = self.step_leaving()  # remove leaving individuals
+        self.to_cpu()
         return leaving
-    
+        
 
 

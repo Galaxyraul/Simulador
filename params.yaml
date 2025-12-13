@@ -1,0 +1,35 @@
+simulation:
+  seed: 42
+  device: "cuda"
+  level: "country" 
+  data_file: ""
+
+population:
+  contacts_per_day: 30
+  mask_factor: 0.5
+  lockdown_factor: 0.4
+  leave_prob: 1e-4
+
+virus:
+  recovery_day: 7
+  death_prob: 0.01
+  P_base: 0.1
+  # Eliminamos 'variant_factor' fijo y añadimos el cronograma:
+  variantes:
+    - name: "Cepa Original" 
+      start_step: 0
+      factor: 1.0
+    
+    - name: "Variante Alfa"
+      start_step: 50
+      factor: 1.5
+
+    - name: "Variante Delta"
+      start_step: 120
+      factor: 2.2
+      
+distributions:
+  susceptibility: {base: 0.7, variance: 0.3}
+  noncompliance: {base: 0.2, variance: 0.8}
+  mobility: {base: 0.5, variance: 0.5}
+  age_factor: {base: 0.1, multiplier: 2.0}
