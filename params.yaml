@@ -8,7 +8,7 @@ population:
   contacts_per_day: 30
   mask_factor: 0.5
   lockdown_factor: 0.4
-  leave_prob: 1e-4
+  leave_prob: 0.0001
 
 virus:
   recovery_day: 7

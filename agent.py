@@ -56,6 +56,11 @@ class Population(Agent):
         self.leaves_step = 0
         self.incomes_step = 0
 
+        self.tensor_attributes = [
+            'susceptibility', 'noncompliance', 'mobility', 'age_factor',
+            'state', 'days_in_state', 'times_infected'
+        ]
+
     def sample_contacts(self, infected_indices):
         # Mueve los arrays a GPU temporalmente
         susceptibles = torch.nonzero((self.state != 1) & (self.state != 3), as_tuple=True)[0]
@@ -149,18 +154,22 @@ class Population(Agent):
         Add new individuals received from another shard.
         `new_individuals` is a dict with the same keys as leaving_shard.
         """
-        if new_individuals is None or new_individuals['N'] == 0:
+        if new_individuals is None:
             return  # nothing to add
 
-        self.state = torch.cat([self.state, new_individuals['state']], dim=0)
-        self.days_in_state = torch.cat([self.days_in_state, new_individuals['days_in_state']], dim=0)
-        self.times_infected = torch.cat([self.times_infected, new_individuals['times_infected']], dim=0)
-        self.susceptibility = torch.cat([self.susceptibility, new_individuals['susceptibility']], dim=0)
-        self.noncompliance = torch.cat([self.noncompliance, new_individuals['noncompliance']], dim=0)
-        self.mobility = torch.cat([self.mobility, new_individuals['mobility']], dim=0)
-        self.age_factor = torch.cat([self.age_factor, new_individuals['age_factor']], dim=0)
+        for attr in self.tensor_attributes:
+            # Obtenemos el tensor actual del agente (self.state, self.mobility...)
+            current_tensor = getattr(self, attr)
+            
+            # Obtenemos el tensor que viene llegando
+            incoming_tensor = new_individuals[attr]
+            
+            # Los unimos. Importante: Ambos deben estar en el mismo dispositivo (CPU)
+            new_tensor = torch.cat([current_tensor, incoming_tensor], dim=0)
+            # Guardamos el resultado de vuelta en el agente
+            setattr(self, attr, new_tensor)
         self.N = self.state.shape[0]
-        self.incomes_step = new_individuals.size(0)
+        self.incomes_step = new_individuals['state'].size(0)
         
     def remove_dead(self):
         """
@@ -211,23 +220,17 @@ class Population(Agent):
         self.state[ready_to_recover] = 2
 
     def to_gpu(self):
-        self.susceptibility = self.susceptibility.to(self.device)
-        self.noncompliance = self.noncompliance.to(self.device)
-        self.mobility = self.mobility.to(self.device)
-        self.age_factor = self.age_factor.to(self.device)
-        self.state = self.state.to(self.device)
-        self.days_in_state = self.days_in_state.to(self.device)
-        self.times_infected = self.times_infected.to(self.device)
+        for attr in self.tensor_attributes:
+            # getattr obtiene el valor, .to() lo mueve, setattr lo guarda de nuevo
+            tensor = getattr(self, attr)
+            setattr(self, attr, tensor.to(self.device))
         self.device = self.device
 
     def to_cpu(self):
-        self.susceptibility = self.susceptibility.to(self.cpu)
-        self.noncompliance = self.noncompliance.to(self.cpu)
-        self.mobility = self.mobility.to(self.cpu)
-        self.age_factor = self.age_factor.to(self.cpu)
-        self.state = self.state.to(self.cpu)
-        self.days_in_state = self.days_in_state.to(self.cpu)
-        self.times_infected = self.times_infected.to(self.cpu)
+        for attr in self.tensor_attributes:
+            # getattr obtiene el valor, .to() lo mueve, setattr lo guarda de nuevo
+            tensor = getattr(self, attr)
+            setattr(self, attr, tensor.to(self.cpu))
         self.device = self.cpu
         torch.cuda.empty_cache()
 
