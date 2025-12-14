@@ -3,6 +3,8 @@ simulation:
   device: "cuda"
   level: "country" 
   initial_infection_rate: 0.005
+  start_vaccination: 80
+  vaccine_rate_daily: 0.05
   data_file: ""
 
 population:
@@ -15,19 +17,7 @@ virus:
   recovery_day: 7
   death_prob: 0.01
   P_base: 0.1
-  # Eliminamos 'variant_factor' fijo y añadimos el cronograma:
-  variantes:
-    - name: "Cepa Original" 
-      start_step: 0
-      factor: 1.0
-    
-    - name: "Variante Alfa"
-      start_step: 50
-      factor: 1.5
-
-    - name: "Variante Delta"
-      start_step: 120
-      factor: 2.2
+  immunity_waning_rate: 0.005
       
 distributions:
   susceptibility: {base: 0.7, variance: 0.3}

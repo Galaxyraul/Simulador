@@ -1,14 +1,12 @@
-import pandas as pd
 import torch
 import yaml
+import pandas as pd
 from tqdm import tqdm
 from agent import Shard
 
 class EpidemicModel:
     def __init__(self, df_data, config_path='config.yaml'):
-        """
-        df_data: DataFrame LIMPIO donde 'id_municipio' YA ES un entero (0..N).
-        """
+        # 1. Cargar Configuración
         with open(config_path, 'r') as f:
             self.params = yaml.safe_load(f)
             
@@ -16,76 +14,145 @@ class EpidemicModel:
         self.step_count = 0
         self.history = []
         
-        # 1. PREPARACIÓN ESTRUCTURAL
+        # Datos básicos del "Tablero"
         self.num_pueblos = len(df_data)
         
-        # El buzón tiene el tamaño exacto del número de filas
+        # Cargamos la población a la GPU (float32 para cálculos)
+        self.population_sizes = torch.tensor(
+            df_data['poblacion'].values, 
+            device=self.device, 
+            dtype=torch.float32
+        )
+        
+        self.valid_ids = torch.arange(self.num_pueblos, device=self.device)
+
+        # -----------------------------------------------------------
+        # 🚀 MOTOR DE GRAVEDAD: CÁLCULO DE VIAJES (BLINDADO)
+        # -----------------------------------------------------------
+        print("🧲 Calculando Matriz de Gravedad (Modo Seguro)...")
+        
+        # A. Extraer Coordenadas a GPU
+        coords = torch.tensor(
+            df_data[['coord_x', 'coord_y']].values, 
+            dtype=torch.float32, 
+            device=self.device
+        )
+        
+        # B. Matriz de Distancias
+        dists = torch.cdist(coords, coords)
+        
+        # 1. Evitar división por cero en distancias (puntos superpuestos)
+        dists = torch.clamp(dists, min=100.0) 
+        
+        # C. Fórmula de Gravedad
+        alpha = 2.0 
+        attraction = self.population_sizes.unsqueeze(0) # [1, N]
+        
+        # Cálculo de pesos
+        weights = attraction / (dists.pow(alpha))
+        
+        # 2. Limpieza agresiva de basura matemática
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # 3. Anular viajes a uno mismo (Diagonal = 0)
+        weights.fill_diagonal_(0.0)
+        
+        # 4. GESTIÓN DE FILAS MUERTAS (CRÍTICO PARA EVITAR CRASH)
+        # Calculamos la suma de cada fila
+        row_sums = weights.sum(dim=1, keepdim=True)
+        
+        # Buscamos pueblos que no atraen a nadie o no tienen a dónde ir (Suma ~ 0)
+        # Esto pasa si el pueblo tiene población 0 o está aislado matemáticamente
+        dead_rows = (row_sums < 1e-9).squeeze()
+        
+        if dead_rows.any():
+            print(f"   ⚠️  Detectadas {dead_rows.sum().item()} filas con probabilidad 0. Corrigiendo...")
+            # A estos pueblos les damos una probabilidad uniforme pequeña para evitar el error
+            # Asignamos 1.0 a todo y luego la normalización lo dejará en 1/N
+            weights[dead_rows] = 1.0
+            # Volvemos a anular su diagonal para que no viajen a sí mismos
+            weights.fill_diagonal_(0.0)
+            # Recalculamos sumas
+            row_sums = weights.sum(dim=1, keepdim=True)
+        
+        # 5. Normalización Final
+        # Añadimos épsilon minúsculo por seguridad absoluta
+        self.travel_probs = weights / (row_sums + 1e-9)
+        
+        # 6. VERIFICACIÓN FINAL (Para dormir tranquilos)
+        # Validamos que ninguna fila tenga NaNs o sume 0
+        if torch.isnan(self.travel_probs).any() or (self.travel_probs.sum(dim=1) < 1e-9).any():
+            print("❌ ERROR CRÍTICO: La matriz sigue corrupta. Revisar datos de entrada.")
+            # Fallback de emergencia: Matriz uniforme
+            self.travel_probs = torch.ones_like(weights) / self.num_pueblos
+        
+        # Limpieza VRAM
+        del dists, coords, weights, attraction, row_sums
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+            
+        print(f"   ✅ Matriz calculada. Shape: {self.travel_probs.shape}")
+
+        # -----------------------------------------------------------
+        # CREACIÓN DE SHARDS (Troceado de la población)
+        # -----------------------------------------------------------
+        self.shards = []
+        self.routing_table = {}
         self.mailbox = [[] for _ in range(self.num_pueblos)]
         
-        self.shards = []
-        self.routing_table = {} 
+        # Tamaño objetivo por bloque (ajustar según tu VRAM)
+        target_shard_size = 10_000_000 
         
-        TARGET_SHARD_SIZE = 500_000 
-        
-        batch = []
+        current_shard_df = []
         current_pop = 0
-        shard_idx = 0
+        shard_id_counter = 0
         
-        # Lista temporal para saber qué IDs (índices) son válidos para viajar
-        valid_ids_list = []
+        print("🏗️  Creando Shards de agentes...")
         
-        # 2. CREACIÓN DE SHARDS
-        print(f"⚙️  Distribuyendo {self.num_pueblos} municipios en Shards GPU...")
-        
-        # Iteramos sobre el DataFrame que nos pasó el main
-        for _, row in tqdm(df_data.iterrows(), total=self.num_pueblos, desc="Creando Shards", unit="pueblo"):
-            pop = int(row['poblacion'])
-            if pop <= 0: continue
+        # Iteramos sobre el DataFrame para agrupar pueblos en Shards
+        # df_data es el GeoDataFrame, pero iterrows funciona igual
+        for _, row in df_data.iterrows():
+            current_shard_df.append(row)
+            current_pop += row['poblacion']
             
-            # Como id_municipio es el índice, esto es un entero seguro
-            valid_ids_list.append(int(row['id_municipio']))
-            
-            batch.append(row)
-            current_pop += pop
-            
-            if current_pop >= TARGET_SHARD_SIZE:
-                self._create_shard(batch, shard_idx)
-                batch = []
-                current_pop = 0
-                shard_idx += 1
+            if current_pop >= target_shard_size:
+                df_chunk = pd.DataFrame(current_shard_df)
+                new_shard = Shard(df_chunk, shard_id_counter, self.params)
+                self.shards.append(new_shard)
                 
-        if batch: self._create_shard(batch, shard_idx)
+                # Mapeamos IDs globales a este Shard
+                for gid in new_shard.global_ids.tolist():
+                    self.routing_table[gid] = shard_id_counter
+                
+                current_shard_df = []
+                current_pop = 0
+                shard_id_counter += 1
         
-        # Tensor de IDs válidos para el enrutador (viajes rápidos)
-        self.valid_ids = torch.tensor(valid_ids_list, dtype=torch.long, device='cpu')
-        
-        print(f"✅ Sharding completado: {len(self.shards)} bloques en {self.device}.")
-
-    def _create_shard(self, batch, idx):
-        df_subset = pd.DataFrame(batch)
-        # agent.py recibirá este subset con la columna 'id_municipio' corregida
-        new_shard = Shard(df_subset, idx, self.params)
-        self.shards.append(new_shard)
-        
-        # Rellenar tabla de enrutamiento
-        for local_idx, global_id in enumerate(new_shard.global_ids.tolist()):
-            self.routing_table[global_id] = (idx, local_idx)
+        # Último shard (remanente)
+        if current_shard_df:
+            df_chunk = pd.DataFrame(current_shard_df)
+            new_shard = Shard(df_chunk, shard_id_counter, self.params)
+            self.shards.append(new_shard)
+            for gid in new_shard.global_ids.tolist():
+                self.routing_table[gid] = shard_id_counter
 
     def step(self):
-        # Reiniciamos buzón
+        # 1. Gestión de Políticas (Lockdown, Vacunas, Mascarillas)
+        self._manage_interventions()
+        
         next_mailbox = [[] for _ in range(self.num_pueblos)]
         daily_stats = {'day': self.step_count, 'S':0, 'I':0, 'R':0, 'D':0, 'Moves': 0}
         
-        # Barra de progreso interna (oculta al terminar para no ensuciar)
+        # Iteramos sobre los trozos de población
         pbar = tqdm(self.shards, desc=f"Día {self.step_count}", leave=False, unit="shard")
-        
         for shard in pbar:
-            # --- FASE 1: CHECK-IN ---
+            # --- RECEPCIÓN DE VIAJEROS ---
             shard_incomers = []
             shard_dest_ids = []
             
-            for local_idx, global_id in enumerate(shard.global_ids.tolist()):
-                # global_id es un entero (índice), acceso directo ultra-rápido
+            local_pueblos = shard.global_ids.tolist()
+            
+            for local_idx, global_id in enumerate(local_pueblos):
                 mail = self.mailbox[global_id]
                 if mail:
                     merged = self._merge_travelers(mail)
@@ -99,28 +166,40 @@ class EpidemicModel:
                 final_dest_ids = torch.cat(shard_dest_ids)
                 shard.add_incomers(final_incomers, final_dest_ids)
 
-            # --- FASE 2: SIMULACIÓN ---
-            shard.to_gpu()
-            seed = shard.base_seed + (self.step_count * 1000)
+            # --- SIMULACIÓN FÍSICA ---
+            shard._to_gpu()
+            
+            # Semilla determinista variable por día
+            seed = shard.base_seed + (self.step_count * 777)
             rng = torch.Generator(device=self.device).manual_seed(seed)
+            
             leavers = shard.step(rng)
             
             stats = shard.get_summary()
             for k in ['S','I','R','D']: daily_stats[k] += stats[k]
-            shard.to_cpu()
             
-            # --- FASE 3: ENRUTAMIENTO ---
+            shard._to_cpu()
+            
+            # --- ENRUTAMIENTO POR GRAVEDAD ---
             if leavers:
-                num_leavers = leavers['state'].shape[0]
-                daily_stats['Moves'] += num_leavers
+                # Los que se van están en CPU. Necesitamos sus IDs en GPU para consultar la matriz.
+                origins_cpu = leavers['origin_global_id']
+                origins_gpu = origins_cpu.to(self.device)
                 
-                # Sorteo de destinos usando solo índices válidos
-                idx_choices = torch.randint(0, len(self.valid_ids), (num_leavers,))
-                destinations = self.valid_ids[idx_choices]
+                num_travelers = origins_gpu.shape[0]
+                daily_stats['Moves'] += num_travelers
                 
-                self._distribute_to_mailboxes(leavers, destinations, next_mailbox)
-            
-            pbar.set_postfix(I=f"{daily_stats['I']:,}")
+                # Consultamos la matriz de viajes para estos orígenes
+                # batch_probs tendrá tamaño [Num_Viajeros, Total_Pueblos]
+                batch_probs = self.travel_probs[origins_gpu]
+                
+                # Sorteo Ponderado: ¿A dónde va cada uno?
+                dest_indices = torch.multinomial(batch_probs, num_samples=1).squeeze()
+                
+                # Volvemos a CPU para repartir el correo
+                destinations_cpu = dest_indices.cpu()
+                
+                self._distribute_to_mailboxes(leavers, destinations_cpu, next_mailbox)
 
         self.mailbox = next_mailbox
         self.history.append(daily_stats)
@@ -128,25 +207,28 @@ class EpidemicModel:
         
         return daily_stats
 
-    # Helpers
-    def _merge_travelers(self, list_of_dicts):
-        if not list_of_dicts: return None
+    # --- MÉTODOS AUXILIARES ---
+    def _manage_interventions(self):
+        day = self.step_count
+        # Ejemplo: Lockdown el día 20
+        if day == 20:
+             print("\n🚨 ALERTA: Confinamiento decretado.")
+             self.params['population']['lockdown_factor'] = 0.7
+
+    def _distribute_to_mailboxes(self, leavers, destinations, mailbox):
+        for i in range(len(destinations)):
+            dest_id = destinations[i].item()
+            # Empaquetamos al viajero individualmente
+            traveler = {k: v[i].unsqueeze(0) for k, v in leavers.items() if k != 'origin_global_id'}
+            mailbox[dest_id].append(traveler)
+
+    def _merge_travelers(self, traveler_list):
+        if not traveler_list: return None
+        keys = traveler_list[0].keys()
         merged = {}
-        for key in list_of_dicts[0].keys():
-            merged[key] = torch.cat([d[key] for d in list_of_dicts], dim=0)
+        for k in keys:
+            merged[k] = torch.cat([t[k] for t in traveler_list])
         return merged
-
-    def _distribute_to_mailboxes(self, leavers, destinations, target_mailbox):
-        unique_dests = torch.unique(destinations)
-        for dest_id in unique_dests:
-            d_id = int(dest_id.item())
-            if d_id >= len(target_mailbox): continue
-            
-            mask = (destinations == dest_id)
-            package = {k: v[mask] for k, v in leavers.items()}
-            target_mailbox[d_id].append(package)
-
-    def export_results(self, filename="resultados.csv"):
-        df = pd.DataFrame(self.history)
-        df.to_csv(filename, index=False)
-        return df
+        
+    def export_results(self, filename):
+        pd.DataFrame(self.history).to_csv(filename, index=False)

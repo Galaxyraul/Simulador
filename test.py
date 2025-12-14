@@ -1,68 +1,54 @@
+import geopandas as gpd
 import pandas as pd
-import time
 from tqdm import tqdm
 from model import EpidemicModel
 
-# CONFIGURACIÓN
-CSV_FILE = 'poblacion_procesada.csv' # Tu archivo original
+# --- CONFIGURACIÓN ---
+# Usamos el archivo que acabamos de crear con el script de preparación
+SHAPEFILE_DATOS = 'municipios_procesados/mapa.shp' 
 CONFIG_FILE = 'params.yaml'
-DIAS_SIMULACION = 100
+DIAS_SIMULACION = 365
 
 def main():
-    print("🚀 INICIANDO SIMULADOR (Gestión de Datos en Main)")
-    print("================================================")
+    print("🚀 INICIANDO SIMULADOR (Modo Geográfico)")
     
-    # 1. ETL: EXTRACCIÓN Y TRANSFORMACIÓN
-    print(f"📂 Cargando {CSV_FILE}...")
-    
-    # Leemos todo como string para no romper IDs como "001"
-    df = pd.read_csv(CSV_FILE, dtype={'id_municipio': str})
-    
-    print(f"   Municipios encontrados: {len(df)}")
-    
-    # --- LA MAGIA: REEMPLAZO DE ID ---
-    # Guardamos el ID original (string) para referencias futuras o logs
-    df['id_original'] = df['id_municipio']
-    
-    # Sobrescribimos 'id_municipio' con el índice numérico (0, 1, 2...)
-    # Esto es lo que la GPU necesita: enteros secuenciales.
-    df['id_municipio'] = df.index
-    
-    print("✅ IDs transformados a enteros secuenciales (0..N) para la GPU.")
-
-    # 2. INICIALIZAR MODELO
-    # Le pasamos el DataFrame ya modificado, NO la ruta del archivo
+    # 1. CARGA DEL "TABLERO" (Shapefile procesado)
+    print(f"🌍 Leyendo archivo maestro: {SHAPEFILE_DATOS}...")
     try:
-        start_init = time.time()
-        modelo = EpidemicModel(df_data=df, config_path=CONFIG_FILE)
-        end_init = time.time()
-        print(f"⏱️  Modelo inicializado en {end_init - start_init:.2f} s")
+        # Geopandas carga el archivo con geometría y datos
+        gdf = gpd.read_file(SHAPEFILE_DATOS)
     except Exception as e:
-        print(f"❌ Error al iniciar modelo: {e}")
+        print(f"❌ Error: No se encuentra el archivo. Ejecuta primero 'preparar_mapa_excel.py'.\n{e}")
         return
 
-    # 3. BUCLE DE SIMULACIÓN
-    print(f"\n▶️  Ejecutando {DIAS_SIMULACION} días...")
-    pbar = tqdm(range(DIAS_SIMULACION), desc="Simulación", unit="día")
+    # 2. PREPARACIÓN MÍNIMA
+    # Nos aseguramos de tener el índice interno 0..N para los tensores
+    # El modelo necesita saber que el pueblo 0 es la fila 0, el 1 la fila 1, etc.
+    gdf = gdf.reset_index(drop=True)
+    gdf['id_municipio'] = gdf.index
     
+    print(f"   -> {len(gdf)} Municipios cargados.")
+    print(f"   -> Población Total: {gdf['poblacion'].sum():,}")
+
+    # 3. INICIALIZAR MODELO
+    # Le pasamos el GeoDataFrame entero.
+    # El modelo buscará dentro las columnas 'coord_x', 'coord_y' y 'poblacion'.
+    modelo = EpidemicModel(df_data=gdf, config_path=CONFIG_FILE)
+
+    # 4. BUCLE DE SIMULACIÓN
+    pbar = tqdm(range(DIAS_SIMULACION), desc="Simulando", unit="día")
     for dia in pbar:
         stats = modelo.step()
         
-        # Actualizamos la barra con info en tiempo real
+        # Info en la barra de progreso
         pbar.set_postfix(
-            Inf=f"{stats['I']:,}", 
-            Mue=f"{stats['D']:,}", 
+            Infectados=f"{stats['I']:,}", 
             Viajes=f"{stats['Moves']:,}"
         )
-
-    # 4. EXPORTACIÓN
-    print("\n💾 Guardando resultados...")
-    # Si quieres recuperar los nombres originales en el CSV final:
-    # Podrías hacer un merge con el df original si guardas estadísticas por pueblo.
-    # Para estadísticas globales, basta con esto:
+        
+    # 5. EXPORTAR RESULTADOS
     modelo.export_results("resultados_finales.csv")
-    
-    print("✅ Proceso terminado.")
+    print("\n✅ Simulación terminada.")
 
 if __name__ == "__main__":
     main()
