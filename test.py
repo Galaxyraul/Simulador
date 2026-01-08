@@ -1,54 +1,187 @@
-import geopandas as gpd
-import pandas as pd
+import gradio as gr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import torch
 from tqdm import tqdm
+
+from visualizer import VisualizadorMapa
 from model import EpidemicModel
+from utils import (
+    cargar_yaml_config, actualizar_parametros, actualizar_subparametros,
+    actualizar_editor, guardar_valor, 
+    agregar_parametro_nivel_2, eliminar_parametro_nivel_2
+)
 
-# --- CONFIGURACIÓN ---
-# Usamos el archivo que acabamos de crear con el script de preparación
-SHAPEFILE_DATOS = 'municipios_procesados/mapa.shp' 
-CONFIG_FILE = 'params.yaml'
-DIAS_SIMULACION = 365
+# Configuración
+ARCHIVO_MAPA = "municipios_procesados/mapa.shp"
+DOT_SCALE = 5000
 
-def main():
-    print("🚀 INICIANDO SIMULADOR (Modo Geográfico)")
-    
-    # 1. CARGA DEL "TABLERO" (Shapefile procesado)
-    print(f"🌍 Leyendo archivo maestro: {SHAPEFILE_DATOS}...")
-    try:
-        # Geopandas carga el archivo con geometría y datos
-        gdf = gpd.read_file(SHAPEFILE_DATOS)
-    except Exception as e:
-        print(f"❌ Error: No se encuentra el archivo. Ejecuta primero 'preparar_mapa_excel.py'.\n{e}")
+print("⏳ [APP] Inicializando...")
+try:
+    VIS = VisualizadorMapa(ARCHIVO_MAPA, DOT_SCALE)
+except:
+    VIS = None
+
+def dibujar_mapa():
+    return VIS.dibujar() if VIS else None
+
+# ─────────────────────────────────────────────
+# BUCLE PRINCIPAL
+# ─────────────────────────────────────────────
+def bucle_simulacion(estado_config):
+    if VIS is None: 
+        yield None, None, "❌ Error visual", "Error"
+        return
+    if not estado_config: 
+        yield VIS.dibujar(), None, "⚠️ Carga YAML", "Esperando..."
         return
 
-    # 2. PREPARACIÓN MÍNIMA
-    # Nos aseguramos de tener el índice interno 0..N para los tensores
-    # El modelo necesita saber que el pueblo 0 es la fila 0, el 1 la fila 1, etc.
-    gdf = gdf.reset_index(drop=True)
-    gdf['id_municipio'] = gdf.index
+    try:
+        n_steps = int(estado_config.get('simulation', {}).get('steps', 200))
+    except: n_steps = 200
+
+    print("🚀 [APP] Iniciando...")
     
-    print(f"   -> {len(gdf)} Municipios cargados.")
-    print(f"   -> Población Total: {gdf['poblacion'].sum():,}")
+    # Estado inicial visual
+    fig_mapa = VIS.dibujar()
+    yield fig_mapa, None, "⚙️ Calculando...", "Cargando..."
 
-    # 3. INICIALIZAR MODELO
-    # Le pasamos el GeoDataFrame entero.
-    # El modelo buscará dentro las columnas 'coord_x', 'coord_y' y 'poblacion'.
-    modelo = EpidemicModel(df_data=gdf, config_path=CONFIG_FILE)
+    try:
+        modelo = EpidemicModel(VIS.gdf, estado_config)
+    except Exception as e:
+        yield fig_mapa, None, f"Error: {e}", "Error"
+        return
 
-    # 4. BUCLE DE SIMULACIÓN
-    pbar = tqdm(range(DIAS_SIMULACION), desc="Simulando", unit="día")
-    for dia in pbar:
+    # Historial para las gráficas
+    historia = []
+    PLOT_FREQUENCY = 5 
+    
+    for i in tqdm(range(n_steps), desc="🦠 Simulando", unit="step"):
         stats = modelo.step()
+        historia.append(stats) # Guardamos datos
         
-        # Info en la barra de progreso
-        pbar.set_postfix(
-            Infectados=f"{stats['I']:,}", 
-            Viajes=f"{stats['Moves']:,}"
+        # Cálculos para el Panel de Texto (Stats Globales)
+        total_pop = stats['S'] + stats['I'] + stats['R'] + stats['D']
+        if total_pop == 0: total_pop = 1
+        
+        pct_s = (stats['S'] / total_pop) * 100
+        pct_i = (stats['I'] / total_pop) * 100
+        pct_r = (stats['R'] / total_pop) * 100
+        pct_d = (stats['D'] / total_pop) * 100
+        
+        texto_stats = (
+            f"📅 DÍA {stats['day']}/{n_steps}\n"
+            f"────────────────\n"
+            f"🟢 Sanos:      {stats['S']:,.0f} ({pct_s:.1f}%)\n"
+            f"🔴 Infectados: {stats['I']:,.0f} ({pct_i:.1f}%)\n"
+            f"🔵 Recuperados:{stats['R']:,.0f} ({pct_r:.1f}%)\n"
+            f"⚪ Fallecidos:  {stats['D']:,.0f} ({pct_d:.1f}%)\n"
+            f"────────────────\n"
+            f"🚗 Viajes hoy: {stats['Moves']:,.0f}"
         )
-        
-    # 5. EXPORTAR RESULTADOS
-    modelo.export_results("resultados_finales.csv")
-    print("\n✅ Simulación terminada.")
+
+        # Renderizado (Mapa + Curvas)
+        if i % PLOT_FREQUENCY == 0 or i == n_steps - 1:
+            # 1. Mapa
+            ratios = modelo.obtener_estado_visual()
+            VIS.actualizar_colores(ratios)
+            fig_mapa = VIS.dibujar()
+            
+            # 2. Curvas SIR
+            fig_curvas = VIS.dibujar_curvas(historia)
+            
+            yield fig_mapa, fig_curvas, "🟢 Simulando...", texto_stats
+        else:
+            # Solo actualizamos texto en pasos intermedios (más rápido)
+            yield gr.update(), gr.update(), "🟢 Simulando (Turbo)...", texto_stats
+    
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    ratios = modelo.obtener_estado_visual()
+    VIS.actualizar_colores(ratios)
+    fig_mapa = VIS.dibujar()
+    
+    # 2. Curvas SIR
+    yield fig_mapa, VIS.dibujar_curvas(historia), "✅ Finalizado", texto_stats
+
+def placeholder(): return "..."
+
+# ─────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────
+with gr.Blocks(title="Simulador Epidemias") as demo:
+    estado = gr.State({})
+
+    gr.Markdown("# 🦠 Simulador: Dashboard Global")
+    
+    with gr.Row():
+        # COLUMNA IZQUIERDA (Configuración)
+        with gr.Column(scale=1):
+            archivo = gr.File(label="📂 Configuración YAML")
+            
+            seccion = gr.Dropdown(label="Sección")
+            parametro = gr.Dropdown(label="Parámetro", allow_custom_value=True)
+            subparametro = gr.Dropdown(label="Propiedad", visible=False, allow_custom_value=True)
+            valor = gr.Number(label="Valor")
+            
+            gr.HTML("<hr>")
+            
+            with gr.Group(visible=False) as panel_variantes:
+                gr.Markdown("### 🧬 Variantes")
+                with gr.Row():
+                    nuevo_nombre = gr.Textbox(placeholder="Nombre", show_label=False, container=False)
+                with gr.Row():
+                    btn_add = gr.Button("➕", size="sm")
+                    btn_del = gr.Button("🗑️", variant="stop", size="sm")
+            
+            gr.HTML("<hr>")
+            
+            # PANEL DE ESTADÍSTICAS EN VIVO (Movido aquí para visibilidad)
+            stats_box = gr.Textbox(label="📊 Estadísticas Globales", lines=8, value="Esperando datos...")
+
+            gr.HTML("<hr>")
+            btn_run = gr.Button("▶ EJECUTAR", variant="primary")
+            btn_stop = gr.Button("⏹ DETENER", variant="stop")
+
+        # COLUMNA DERECHA (Visualización Doble)
+        with gr.Column(scale=3):
+            # 1. Mapa Geográfico
+            plot_mapa = gr.Plot(label="Mapa de Propagación")
+            
+            # 2. Gráfico de Curvas
+            plot_curvas = gr.Plot(label="Curvas SIR (Evolución Temporal)")
+            
+            info = gr.Textbox(label="Estado del Sistema", value="Listo.")
+
+    # ─────────────────────────────────────────────
+    # EVENTOS
+    # ─────────────────────────────────────────────
+    
+    demo.load(dibujar_mapa, None, plot_mapa)
+    
+    archivo.change(cargar_yaml_config, archivo, [estado, seccion, parametro, valor, info])
+    seccion.change(actualizar_parametros, [seccion, estado], [parametro, valor])
+    
+    parametro.change(
+        actualizar_subparametros, 
+        [seccion, parametro, estado], 
+        [subparametro, valor, panel_variantes]
+    )
+    
+    subparametro.change(actualizar_editor, [seccion, parametro, subparametro, estado], valor)
+    valor.change(guardar_valor, [seccion, parametro, subparametro, valor, estado], estado)
+
+    btn_add.click(agregar_parametro_nivel_2, [seccion, parametro, nuevo_nombre, estado], [estado, parametro, info])
+    btn_del.click(eliminar_parametro_nivel_2, [seccion, parametro, estado], [estado, parametro, info])
+
+    # Ejecución conecta con DOS plots y UN textbox de stats
+    evento_run = btn_run.click(
+        bucle_simulacion, 
+        inputs=[estado], 
+        outputs=[plot_mapa, plot_curvas, info, stats_box]
+    )
+    
+    btn_stop.click(fn=None, inputs=None, outputs=None, cancels=[evento_run])
 
 if __name__ == "__main__":
-    main()
+    demo.queue().launch()

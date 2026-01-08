@@ -1,23 +1,24 @@
 simulation:
   seed: 42
   device: "cuda"
-  level: "country" 
-  initial_infection_rate: 0.005
+  steps: 365
+  initial infection rate: 0.005
   start_vaccination: 80
   vaccine_rate_daily: 0.05
-  data_file: ""
 
 population:
   contacts_per_day: 30
   mask_factor: 0.5
   lockdown_factor: 0.4
-  leave_prob: 0.0001
+  leave_prob: 0.001
 
-virus:
-  recovery_day: 7
-  death_prob: 0.01
-  P_base: 0.1
-  immunity_waning_rate: 0.005
+variants:
+    original_strain:
+      P_base: 0.5
+      recovery_day: 7
+      death_prob: 0.02
+      immunity_waning_rate: 0.005
+      step_start: 0
       
 distributions:
   susceptibility: {base: 0.7, variance: 0.3}
